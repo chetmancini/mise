@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Resolving a run's dependency graph loads only reachable config roots, and the
+# scheduler reuses that load for every task instead of reloading per task.
+export MISE_EXPERIMENTAL=1
+
+cat >mise.toml <<'TOML'
+monorepo_root = true
+
+[monorepo]
+config_roots = ["projects/*", "unrelated"]
+
+# Not reachable from //projects/p1:build, so //unrelated must stay unloaded.
+[tasks.other]
+depends = ["//unrelated:x"]
+run = "echo other"
+TOML
+
+mkdir -p projects/p1 projects/p2 projects/p3 projects/w unrelated
+cat >projects/p1/mise.toml <<'TOML'
+[tasks.build]
+depends = ["//projects/p2:build"]
+wait_for = ["//projects/w:x"]
+run = "echo p1"
+TOML
+cat >projects/p2/mise.toml <<'TOML'
+[tasks.build]
+depends = ["//projects/p3:build"]
+run = "echo p2"
+TOML
+cat >projects/p3/mise.toml <<'TOML'
+[tasks.build]
+run = "echo p3"
+TOML
+cat >projects/w/mise.toml <<'TOML'
+[tasks.x]
+run = "echo w"
+TOML
+cat >unrelated/mise.toml <<'TOML'
+[tasks.x]
+run = "echo unrelated"
+TOML
+
+assert "mise run //projects/p1:build" "p3
+p2
+p1"
+
+assert_succeed "MISE_TRACE=1 mise run //projects/p1:build >/dev/null 2>trace.log"
+assert_not_contains "cat trace.log" "loaded task //unrelated:x"
+load_count=$(awk '/config::load_all_tasks_with_context start/ {count++} END {print count+0}' trace.log)
+# One default load, then one load per dependency level that adds config roots:
+# {p1, p2, w} and {p1, p2, p3, w}. Final resolution and scheduling reuse the last.
+if ((load_count != 3)); then
+  fail "expected 3 task loads for the dependency graph, got $load_count"
+fi

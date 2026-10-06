@@ -2053,20 +2053,14 @@ impl Task {
         }
         let tasks_to_run: HashSet<&Task> = tasks_to_run.iter().collect();
 
-        // Build context with path hints from self, tasks_to_run, and dependency patterns
-        // Resolve patterns before extracting paths to handle local deps (e.g., ":A")
-        let path_hints: Vec<String> = once(&self.name)
-            .chain(tasks_to_run.iter().map(|t| &t.name))
-            .filter_map(|name| extract_monorepo_path(name))
-            .chain(
-                self.depends
-                    .iter()
-                    .chain(self.wait_for.iter())
-                    .chain(self.depends_post.iter())
-                    .map(|td| resolve_task_pattern(&td.task, Some(self)))
-                    .filter_map(|resolved| extract_monorepo_path(&resolved)),
-            )
-            .unique()
+        // Every task in one run shares the same hint set, so the scheduler loads
+        // tasks once per graph instead of once per task. Loading more config
+        // roots only adds tasks; explicit and wildcard matches are unchanged.
+        let path_hints: Vec<String> = once(self)
+            .chain(tasks_to_run.iter().copied())
+            .flat_map(task_path_hints)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect();
 
         let ctx = if !path_hints.is_empty() {
@@ -3646,6 +3640,19 @@ pub fn extract_monorepo_path(name: &str) -> Option<String> {
         // Find the FIRST colon after "//" prefix to handle task names with colons like "do:item-1"
         stripped.find(':').map(|idx| stripped[..idx].to_string())
     })
+}
+
+/// Monorepo paths a task and its dependency patterns refer to.
+pub(crate) fn task_path_hints(task: &Task) -> impl Iterator<Item = String> + '_ {
+    extract_monorepo_path(&task.name).into_iter().chain(
+        task.depends
+            .iter()
+            .chain(task.wait_for.iter())
+            .chain(task.depends_post.iter())
+            .filter_map(move |td| {
+                extract_monorepo_path(&resolve_task_pattern(&td.task, Some(task)))
+            }),
+    )
 }
 
 /// Build a map of task names and aliases to task references
@@ -5916,6 +5923,42 @@ echo "hello world"
             extract_monorepo_path("//apps/backend:build:prod"),
             Some("apps/backend".to_string())
         );
+    }
+
+    #[test]
+    fn test_task_path_hints() {
+        use super::task_path_hints;
+        use crate::task::task_dep::TaskDep;
+
+        let dep = |pattern: &str| TaskDep::from(pattern.to_string());
+
+        // A monorepo task hints its own path plus every dependency kind,
+        // resolving local patterns against the task's own path.
+        let task = Task {
+            name: "//projects/frontend:build".to_string(),
+            depends: vec![dep(":codegen"), dep("//libs/shared:build")],
+            wait_for: vec![dep("//services/api:up")],
+            depends_post: vec![dep("//tools/...:lint")],
+            ..Default::default()
+        };
+        assert_eq!(
+            task_path_hints(&task).collect::<Vec<_>>(),
+            [
+                "projects/frontend",
+                "projects/frontend",
+                "libs/shared",
+                "services/api",
+                "tools/...",
+            ]
+        );
+
+        // A non-monorepo task and its plain dependencies have no paths.
+        let task = Task {
+            name: "build".to_string(),
+            depends: vec![dep("lint"), dep(":test")],
+            ..Default::default()
+        };
+        assert_eq!(task_path_hints(&task).count(), 0);
     }
 
     #[test]

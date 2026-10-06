@@ -1,8 +1,8 @@
 use crate::config::{self, Config, SettingsExt};
 use crate::file::display_path;
 use crate::task::{
-    GetMatchingExt, Task, TaskLoadContext, extract_monorepo_path, is_workspace_project_task,
-    resolve_task_pattern,
+    GetMatchingExt, Task, TaskLoadContext, dep_has_usage_ref, is_workspace_project_task,
+    match_tasks_with_context, task_path_hints,
 };
 use crate::ui::ctrlc;
 use crate::ui::{prompt, style};
@@ -11,7 +11,7 @@ use console::Term;
 use demand::{DemandOption, Select};
 use eyre::{Result, bail, ensure, eyre};
 use itertools::Itertools;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::iter::once;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -591,64 +591,43 @@ pub async fn get_task_lists(
 /// Resolve all dependencies for a list of tasks
 /// Iteratively discovers path hints by loading tasks and their dependencies
 pub async fn resolve_depends(config: &Arc<Config>, tasks: Vec<Task>) -> Result<Vec<Task>> {
-    // Iteratively discover all path hints by loading tasks and their dependencies
-    // This handles chains like: //A:B -> :C -> :D -> //E:F where we need to discover E
-    let mut all_path_hints = HashSet::new();
-    let mut tasks_to_process: Vec<Task> = tasks.clone();
-    let mut processed_tasks = HashSet::new();
+    // Walk the dependency graph breadth-first, widening the load context only
+    // with paths that reachable tasks reference. This handles chains like
+    // //A:B -> :C -> :D -> //E:F where E is discovered through C and D.
+    let mut all_path_hints = BTreeSet::new();
+    let mut seen: HashSet<String> = tasks.iter().map(|t| t.name.clone()).collect();
+    let mut frontier: Vec<Task> = tasks.clone();
 
-    // Iteratively discover paths until no new paths are found
-    while !tasks_to_process.is_empty() {
-        // Extract path hints from current batch of tasks
-        let new_hints: Vec<String> = tasks_to_process
-            .iter()
-            .filter_map(|t| extract_monorepo_path(&t.name))
-            .chain(tasks_to_process.iter().flat_map(|t| {
-                t.depends
-                    .iter()
-                    .chain(t.wait_for.iter())
-                    .chain(t.depends_post.iter())
-                    .map(|td| resolve_task_pattern(&td.task, Some(t)))
-                    .filter_map(|resolved| extract_monorepo_path(&resolved))
-            }))
-            .collect();
-
-        // Check if we found any new paths
-        let mut had_new_hints = false;
-        for h in &new_hints {
-            if all_path_hints.insert(h.clone()) {
-                had_new_hints = true;
-            }
-        }
-        if !had_new_hints {
+    while !frontier.is_empty() {
+        all_path_hints.extend(frontier.iter().flat_map(task_path_hints));
+        if all_path_hints.is_empty() {
             break;
         }
-
-        // Load tasks with current path hints to discover dependencies
-        let ctx = Some(TaskLoadContext {
+        let ctx = TaskLoadContext {
             path_hints: all_path_hints.iter().cloned().collect(),
             load_all: false,
-        });
-
-        let loaded_tasks = config.tasks_with_context(ctx.as_ref()).await?;
-
-        // Find new tasks that haven't been processed yet
-        tasks_to_process = loaded_tasks
-            .values()
-            .filter(|t| processed_tasks.insert(t.name.clone()))
-            .cloned()
+        };
+        let loaded_tasks = config.tasks_with_context(Some(&ctx)).await?;
+        let tasks_ref = crate::task::build_task_ref_map(loaded_tasks.iter());
+        // Unmatched dependencies are reported by all_depends below.
+        frontier = frontier
+            .iter()
+            .flat_map(|t| {
+                t.depends
+                    .iter()
+                    .chain(t.depends_post.iter())
+                    .filter(|td| !dep_has_usage_ref(td))
+                    .filter_map(|td| match_tasks_with_context(&tasks_ref, td, Some(t)).ok())
+                    .flatten()
+            })
+            .filter(|t| seen.insert(t.name.clone()))
             .collect();
     }
 
-    // Now load all tasks with the complete set of path hints
-    let ctx = if !all_path_hints.is_empty() {
-        Some(TaskLoadContext {
-            path_hints: all_path_hints.into_iter().collect(),
-            load_all: false,
-        })
-    } else {
-        None
-    };
+    let ctx = (!all_path_hints.is_empty()).then(|| TaskLoadContext {
+        path_hints: all_path_hints.into_iter().collect(),
+        load_all: false,
+    });
 
     let all_tasks = config.tasks_with_context(ctx.as_ref()).await?;
 

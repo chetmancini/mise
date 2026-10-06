@@ -1110,18 +1110,31 @@ impl Config {
         self.tasks_with_context(None).await
     }
 
+    /// Expands path aliases and canonicalizes hints so equivalent contexts share
+    /// one cache entry. Hints are a set; their order must not split the cache.
+    fn normalize_task_load_context(
+        &self,
+        ctx: Option<&crate::task::TaskLoadContext>,
+    ) -> Result<Option<crate::task::TaskLoadContext>> {
+        // Resolve aliases even without a context so invalid aliases still fail.
+        let path_aliases = self.monorepo_path_aliases()?;
+        let Some(ctx) = ctx else {
+            return Ok(None);
+        };
+        let mut ctx = ctx.clone();
+        for hint in &mut ctx.path_hints {
+            *hint = expand_monorepo_path_alias(hint, &path_aliases);
+        }
+        ctx.path_hints.sort_unstable();
+        ctx.path_hints.dedup();
+        Ok(Some(ctx))
+    }
+
     pub async fn tasks_with_context(
         &self,
         ctx: Option<&crate::task::TaskLoadContext>,
     ) -> Result<Arc<BTreeMap<String, Task>>> {
-        let path_aliases = self.monorepo_path_aliases()?;
-        let expanded_ctx = ctx.map(|ctx| {
-            let mut ctx = ctx.clone();
-            for hint in &mut ctx.path_hints {
-                *hint = expand_monorepo_path_alias(hint, &path_aliases);
-            }
-            ctx
-        });
+        let expanded_ctx = self.normalize_task_load_context(ctx)?;
         // Use the entire context as cache key
         // Default context (None) becomes TaskLoadContext::default()
         let cache_key = expanded_ctx.clone().unwrap_or_default();
@@ -1148,11 +1161,7 @@ impl Config {
         &self,
         ctx: Option<&crate::task::TaskLoadContext>,
     ) -> Result<Arc<BTreeMap<String, Task>>> {
-        let path_aliases = self.monorepo_path_aliases()?;
-        let mut cache_key = ctx.cloned().unwrap_or_default();
-        for hint in &mut cache_key.path_hints {
-            *hint = expand_monorepo_path_alias(hint, &path_aliases);
-        }
+        let cache_key = self.normalize_task_load_context(ctx)?.unwrap_or_default();
         self.tasks_cache.remove(&cache_key);
         self.tasks_with_context(ctx).await
     }
@@ -9524,6 +9533,27 @@ vars = { target = "linux" }
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].name, "build");
         assert_eq!(tasks[0].description, "linux");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tasks_with_context_cache_ignores_hint_order_and_duplicates() -> Result<()> {
+        let config = Config::get().await?;
+        let ctx = |hints: &[&str]| crate::task::TaskLoadContext {
+            path_hints: hints.iter().map(|h| h.to_string()).collect(),
+            load_all: false,
+        };
+        let first = config
+            .tasks_with_context(Some(&ctx(&[
+                "hint-order-b",
+                "hint-order-a",
+                "hint-order-b",
+            ])))
+            .await?;
+        let second = config
+            .tasks_with_context(Some(&ctx(&["hint-order-a", "hint-order-b"])))
+            .await?;
+        assert!(Arc::ptr_eq(&first, &second));
         Ok(())
     }
 }
